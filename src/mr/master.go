@@ -588,7 +588,7 @@ func(a *AnotherJobTracker) ScheduleAvailableReduceTask(worker Workermeta) (TaskI
 	return v, true
 }
 
-func(a *AnotherJobTracker) init() bool {
+func(a *Master) init() bool {
 	wm := TaskManager{}
 	wm.WorkerMonitor = WorkerMonitor{workers: []Workermeta{}}
 	wm.MapTaskTable = TaskLookupTable{
@@ -601,8 +601,8 @@ func(a *AnotherJobTracker) init() bool {
 		workerTaskLookupTable: map[string][]*TaskInfo{},
 	}
 	//set error handler func
-	wm.WorkerErrorHandlerFunc = a.workerErrorHandler()
-	a.taskManager = wm
+	wm.WorkerErrorHandlerFunc = a.JobTracker.workerErrorHandler()
+	a.JobTracker.taskManager = wm
 	return true
 }
 
@@ -630,7 +630,7 @@ func (a *AnotherJobTracker) workerErrorHandler() func(workerId string, manager *
 func MakeMaster(files []string, nReduce int32) *Master {
 	m := Master{}
 
-	m.JobTracker.init()
+	m.init()
 
 	m.JobTracker.Accept(files, nReduce)
 	// listen to the worker state

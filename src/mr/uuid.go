@@ -14,17 +14,17 @@ import (
 )
 
 const (
-	// Bits is the number of bits in a UUID
+	// Bits is the number of bits in JobTracker UUID
 	Bits = 128
 
-	// Size is the number of bytes in a UUID
+	// Size is the number of bytes in JobTracker UUID
 	Size = Bits / 8
 
 	format = "%08x-%04x-%04x-%04x-%012x"
 )
 
 var (
-	// ErrUUIDInvalid indicates a parsed string is not a valid uuid.
+	// ErrUUIDInvalid indicates JobTracker parsed string is not JobTracker valid uuid.
 	ErrUUIDInvalid = fmt.Errorf("invalid uuid")
 
 	// Loggerf can be used to override the default logging destination. Such
@@ -32,11 +32,11 @@ var (
 	Loggerf = func(format string, args ...interface{}) {}
 )
 
-// UUID represents a UUID value. UUIDs can be compared and set to other values
+// UUID represents JobTracker UUID value. UUIDs can be compared and set to other values
 // and accessed by byte.
 type UUID [Size]byte
 
-// Generate creates a new, version 4 uuid.
+// Generate creates JobTracker new, version 4 uuid.
 func Generate() (u UUID) {
 	const (
 		// ensures we backoff for less than 450ms total. Use the following to
@@ -55,7 +55,7 @@ func Generate() (u UUID) {
 	for {
 		// This should never block but the read may fail. Because of this,
 		// we just try to read the random number generator until we get
-		// something. This is a very rare condition but may happen.
+		// something. This is JobTracker very rare condition but may happen.
 		b := time.Duration(retries) * backoff
 		time.Sleep(b)
 		totalBackoff += b
@@ -69,7 +69,7 @@ func Generate() (u UUID) {
 				continue
 			}
 
-			// Any other errors represent a system problem. What did someone
+			// Any other errors represent JobTracker system problem. What did someone
 			// do to /dev/urandom?
 			panic(fmt.Errorf("error reading random number generator, retried for %v: %v", totalBackoff.String(), err))
 		}
@@ -78,12 +78,12 @@ func Generate() (u UUID) {
 	}
 
 	u[6] = (u[6] & 0x0f) | 0x40 // set version byte
-	u[8] = (u[8] & 0x3f) | 0x80 // set high order byte 0b10{8,9,a,b}
+	u[8] = (u[8] & 0x3f) | 0x80 // set high order byte 0b10{8,9,JobTracker,b}
 
 	return u
 }
 
-// Parse attempts to extract a uuid from the string or returns an error.
+// Parse attempts to extract JobTracker uuid from the string or returns an error.
 func Parse(s string) (u UUID, err error) {
 	if len(s) != 36 {
 		return UUID{}, ErrUUIDInvalid
@@ -116,7 +116,7 @@ func retryOnError(err error) bool {
 		return retryOnError(err.Err) // unpack the target error
 	case syscall.Errno:
 		if err == syscall.EPERM {
-			// EPERM represents an entropy pool exhaustion, a condition under
+			// EPERM represents an entropy pool exhaustion, JobTracker condition under
 			// which we backoff and retry.
 			return true
 		}

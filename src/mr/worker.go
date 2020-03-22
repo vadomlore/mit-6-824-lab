@@ -21,12 +21,14 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-var mchan = make(chan TaskInfo)
-var rchan = make(chan TaskInfo)
-var workerState = WIdle
-var workerId = Generate().String()
+var wm = &Workermeta{
+	WorkerId:       Generate().String(),
+	State:          WIdle,
+	lastUpdateTime: time.Now().Unix(),
+}
+
 //
-// Map functions return a slice of KeyValue.
+// Map functions return JobTracker slice of KeyValue.
 //
 type KeyValue struct {
 	Key   string
@@ -52,11 +54,24 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 
+func (w* Workermeta) Update(state WorkerState) Workermeta {
+	w.State = state
+	w.lastUpdateTime = time.Now().Unix()
+	nw := *w
+	return nw
+}
+
+func (w* Workermeta) GetNow() Workermeta {
+	w.lastUpdateTime = time.Now().Unix()
+	nw := *w
+	return nw
+}
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	args :=  WorkerStatusArgs { WorkerMeta:Workermeta{ WorkerId: workerId, State: workerState, lastUpdateTime: time.Now().Unix()}}
+	args :=  WorkerStatusArgs { WorkerMeta: wm.Update(WBusy)}
 
 	reply := JoinMasterReply {}
 
@@ -65,13 +80,13 @@ func Worker(mapf func(string, string) []KeyValue,
 		return
 	}
 
-	// do report worker health status periodically
+	// do health check and report to master periodically
 	go func() {
 		ticker := time.NewTicker(3000 * time.Millisecond)
 		for {
 			select {
 			case <-ticker.C:
-				args := WorkerStatusArgs {WorkerMeta:Workermeta{ WorkerId: workerId, State: workerState, lastUpdateTime: time.Now().Unix()}}
+				args := WorkerStatusArgs {wm.GetNow()}
 				reply := ReportStatusReply {}
 				call("Master.ReportStatus", &args, &reply)
 				//consider when to exit
@@ -79,74 +94,30 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 	}()
 
-	// do request job
+	// do request task (map & reduce) if worker is idle
 	go func() {
 		ticker := time.NewTicker(3000 * time.Millisecond)
 		for {
 			select {
 			case <-ticker.C:
-				args := WorkerStatusArgs {WorkerMeta:Workermeta{ WorkerId: workerId, State: workerState, lastUpdateTime: time.Now().Unix()}}
-				reply := ReportStatusReply {}
-				call("Master.ReportStatus", &args, &reply)
-				//consider when to exit
+				if wm.State != WIdle {
+					return
+				}
+				args := RequestTaskRequest {Workermeta: wm.Update(WBusy)}
+				reply := RequestTaskReply {}
+				call("Master.DoRequestTask", &args, &reply)
+				if reply.Metadata.JobId != "" && reply.Metadata.Type == Map{
+					DoMap(mapf, reply.Metadata)
+				} else if reply.Metadata.JobId != "" && reply.Metadata.Type == Reduce {
+					DoReduce(reducef, reply.Metadata)
+				}
 			}
 		}
 	}()
-
-
-	go func() {
-		taskInfo := <-mchan
-		DoMap(mapf, taskInfo)
-	}()
-
-	go func() {
-		taskInfo := <-rchan
-		DoReduce(reducef, taskInfo)
-	}()
-
-	fmt.Println("init workerId %v", workerId)
-	//finshed := make(chan int)
-
-	//mapFlag := make(chan int)
-	//reduceFlag := make(chan int)
-	//tracker := &TaskTracker{
-	//	state:         WorkerStateIdle,
-	//	taskType:      ActionHealthCheck,
-	//	workerId:      workerId,
-	//	taskId:        "", //taskId not assigned yet, should be assigned by master
-	//	mapContext:    map[string]string{},
-	//	reduceContext: map[string]string{},
-	//}
-	//// report health periodically until master is closed
-	//go HealthCheck(tracker, mapFlag, reduceFlag)
-	//
-	//// request to do the map work
-	//go RequestMapTask(mapFlag, tracker)
-	//
-	//// do map job with one thead
-	//go func() {
-	//	<-mapFlag
-	//	DoMap(mapf, tracker)
-	//}()
-
-	// // do reduce job with another thead
-
-	// // request to do the map work
-	// go RequestReduceTask(tracker)
-
-	// go func() {
-	// 	<-reduceFlag
-	// 	DoReduce(reducef, tracker)
-	// }()
-
-	// CallExample()
-	//<-finshed
-	// request do reduce task with this thread when
-	//report health status in a period
 }
 
 func DoReduce(reducef func(string, []string) string, info TaskInfo) {
-
+	wm.Update(WBusy)
 	metadata := info.metadata.(ReduceMetadata)
 	intermediate := make([]KeyValue, 100)
 	for _, f := range metadata.Filenames {
@@ -181,17 +152,16 @@ func DoReduce(reducef func(string, []string) string, info TaskInfo) {
 	ofile.Close()
 	info.state = Completed
 	metadata.ResultFilename = oname
-
-	args :=  CompleteTaskRequest{workerId: workerId, metadata: info}
+	args :=  CompleteTaskRequest{WorkerMeta: wm.GetNow(), Metadata: info}
 	reply :=  CompleteTaskReply{}
-
+	wm.Update(WIdle)
 	//report reduce task complete
 	call("Master.CompleteReduce", &args, &reply)
 }
 
 
 func DoMap(mapf func(string, string) []KeyValue, info TaskInfo ) {
-
+	wm.Update(WBusy)
 	metadata := info.metadata.(MapMetadata)
 	file, err := os.Open(metadata.Filename)
 	if err != nil {
@@ -207,7 +177,7 @@ func DoMap(mapf func(string, string) []KeyValue, info TaskInfo ) {
 	m1 := make(map[int][]KeyValue)
 
 	for _, kv := range kva {
-		partition := ihash(kv.Key) % metadata.NReduce
+		partition := ihash(kv.Key) % (int)(metadata.NReduce)
 		value, ok := m1[partition]
 		if !ok {
 			value = make([]KeyValue, 10)
@@ -223,11 +193,12 @@ func DoMap(mapf func(string, string) []KeyValue, info TaskInfo ) {
 	//report Map task complete
 	info.state = Completed
 	metadata.IntermediateFiles = intermediates
-	args := CompleteTaskRequest {metadata: info}
+	args :=  CompleteTaskRequest{WorkerMeta: wm.GetNow(), Metadata: info}
 	reply :=  CompleteTaskReply{}
+	wm.Update(WIdle)
 	call("Master.CompleteMap", &args, &reply)
+	
 }
-
 
 // example function to show how to make an RPC call to the master.
 //
@@ -241,7 +212,7 @@ func CallExample() {
 	// fill in the argument(s).
 	args.X = 99
 
-	// declare a reply structure.
+	// declare JobTracker reply structure.
 	reply := ExampleReply{}
 
 	// send the RPC request, wait for the reply.
@@ -249,73 +220,6 @@ func CallExample() {
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
-}
-
-// request map task periodically
-func RequestMapTask(ch chan int, taskTracker *TaskTracker) {
-	if taskTracker.state == WorkerStateIdle {
-		args := TaskTrackerArgs{ActionWorkerRequestMap, WorkerStateIdle, taskTracker.workerId, MapArgs{}, ReduceArgs{}, time.Now().Unix()}
-		reply := TaskTrackerReply{}
-		call("Master.TaskTrackerTrace", &args, &reply)
-		if reply.ActionType == ActionMasterAllowMap {
-			if taskTracker.state == WorkerStateIdle {
-				taskTracker.taskId = reply.MapReply.MapTaskId
-				taskTracker.mapContext = reply.MapReply.MapContext
-			}
-			ch <- 1 //start do map
-		}
-	}
-}
-
-// request reduce task periodically
-func RequestReduceTask(taskTracker *TaskTracker) {
-	if taskTracker.state == WorkerStateIdle || taskTracker.state == WorkerStateMapCompleted || taskTracker.state == WorkerStateReduceCompleted {
-		args := TaskTrackerArgs{ActionWorkerRequestReduce, WorkerStateIdle, taskTracker.workerId, MapArgs{}, ReduceArgs{}, time.Now().Unix()}
-		reply := TaskTrackerReply{}
-		call("Master.TaskTrackerTrace", &args, &reply)
-	}
-}
-
-// timer
-func HealthCheck(taskTracker *TaskTracker, mapFlag chan int, reduceFlag chan int) {
-
-	ticker := time.NewTicker(5000 * time.Millisecond)
-
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				fmt.Println("do health check for worker %v", taskTracker.workerId)
-				// do health check and report current task status
-				args := TaskTrackerArgs{ActionHealthCheck, taskTracker.state, taskTracker.workerId, MapArgs{}, ReduceArgs{}, time.Now().Unix()}
-				reply := TaskTrackerReply{}
-				call("Master.TaskTrackerTrace", &args, &reply)
-				// report health status
-				if reply.ActionType == ActionMasterAllowMap {
-					if taskTracker.state == WorkerStateIdle {
-						taskTracker.taskId = reply.MapReply.MapTaskId
-						taskTracker.mapContext = reply.MapReply.MapContext
-					}
-					mapFlag <- 1 //start do map
-
-				} else if reply.ActionType == ActionMasterAllowReduce {
-					reduceFlag <- 1 // start do reduce
-				} else if reply.ActionType == ActionHealthCheck {
-					fmt.Printf("health check for workerId %v", reply.WorkerId)
-					switch taskTracker.state {
-					case WorkerStateInMap, WorkerStateMapCompleted:
-						fmt.Println("map job %v health check ...", reply.MapReply.MapTaskId)
-					case WorkerStateInReduce, WorkerStateReduceCompleted:
-						fmt.Println("reduce job %v health check ...", reply.ReduceReply.ReduceContext)
-					}
-				}
-			}
-		}
-	}()
 }
 
 //

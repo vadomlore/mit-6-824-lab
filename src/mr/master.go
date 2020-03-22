@@ -117,7 +117,7 @@ type Workermeta struct {
 }
 
 //on worker disabled action
-type WorkerErrorHandler func(workerId string, manager *TaskManager) bool
+type WorkerErrorHandler func(workerId string) bool
 
 //JobTracker worker can only process one task JobTracker time
 // WorkerMonitor worker health status and worker state
@@ -439,7 +439,7 @@ func (a *AnotherJobTracker) StartWorkerListener(){
 							//exceed max value
 							a.taskManager.WorkerMonitor.SetWorkerError(worker)
 							workerId := worker.WorkerId
-							a.taskManager.WorkerErrorHandlerFunc(workerId, &a.taskManager) //handle error
+							a.taskManager.WorkerErrorHandlerFunc(workerId) //handle error
 						}
 					}
 				}
@@ -589,35 +589,35 @@ func(a *AnotherJobTracker) ScheduleAvailableReduceTask(worker Workermeta) (TaskI
 }
 
 func(a *Master) init() bool {
-	wm := TaskManager{}
-	wm.WorkerMonitor = WorkerMonitor{workers: []Workermeta{}}
-	wm.MapTaskTable = TaskLookupTable{
-		taskmeta:              []TaskInfo{},
-		workerTaskLookupTable: map[string][]*TaskInfo{},
+	a.JobTracker = AnotherJobTracker{
+		taskManager:            TaskManager{
+			WorkerMonitor:WorkerMonitor{workers: []Workermeta{}},
+			MapTaskTable:TaskLookupTable{
+				taskmeta:              []TaskInfo{},
+				workerTaskLookupTable: map[string][]*TaskInfo{},
+			},
+			ReduceTaskTable: TaskLookupTable{
+				taskmeta:              []TaskInfo{},
+				workerTaskLookupTable: map[string][]*TaskInfo{},
+			},
+			WorkerErrorHandlerFunc: a.JobTracker.workerErrorHandler(),
+		},
 	}
-
-	wm.ReduceTaskTable = TaskLookupTable{
-		taskmeta:              []TaskInfo{},
-		workerTaskLookupTable: map[string][]*TaskInfo{},
-	}
-	//set error handler func
-	wm.WorkerErrorHandlerFunc = a.JobTracker.workerErrorHandler()
-	a.JobTracker.taskManager = wm
 	return true
 }
 
-func (a *AnotherJobTracker) workerErrorHandler() func(workerId string, manager *TaskManager) bool {
-	return func(workerId string, manager *TaskManager) bool {
+func (a *AnotherJobTracker) workerErrorHandler() func(workerId string) bool {
+	return func(workerId string) bool {
 		//when the worker is error, set all the task to idle state
 		if a.phase == PhaseMap {
-			manager.MapLock.Lock()
-			defer manager.MapLock.Unlock()
-			manager.MapTaskTable.ReleaseAllTask(workerId)
+			a.taskManager.MapLock.Lock()
+			defer a.taskManager.MapLock.Unlock()
+			a.taskManager.MapTaskTable.ReleaseAllTask(workerId)
 		}
 		if a.phase == PhaseReduce {
-			manager.ReduceLock.Lock()
-			defer manager.ReduceLock.Unlock()
-			manager.ReduceTaskTable.ReleaseUnCompleteTask(workerId)
+			a.taskManager.ReduceLock.Lock()
+			defer a.taskManager.ReduceLock.Unlock()
+			a.taskManager.ReduceTaskTable.ReleaseUnCompleteTask(workerId)
 		}
 		return true
 	}

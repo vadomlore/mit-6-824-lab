@@ -1,12 +1,14 @@
 package mr
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/gob"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,25 +34,32 @@ type WorkerStatusArgs struct{
 }
 
 type JoinMasterReply struct{
-	b bool
+	Status bool
 }
 
 type ReportStatusReply struct{
-	b bool
+	Status bool
 }
 
 
 //RPC call join master
 func (m *Master) JoinMaster(args *WorkerStatusArgs, reply *JoinMasterReply) error {
+	log.Printf("start join master %v.\n", args.WorkerMeta.WorkerId)
+	m.JobTracker.taskManager.WorkerMonitor.lock.Lock()
+	defer m.JobTracker.taskManager.WorkerMonitor.lock.Unlock()
 	m.JobTracker.taskManager.WorkerMonitor.AddNewWorker(args.WorkerMeta)
-	reply.b = true
+	reply.Status = true
+	log.Printf("worker %v add succeed.\n", args.WorkerMeta.WorkerId)
 	return nil
 }
 
 //RPC call update to idle if job is reduceDone
 func (m *Master) ReportStatus(args *WorkerStatusArgs, reply *ReportStatusReply) error {
+	// log.Println("Receive health status")
+	m.JobTracker.taskManager.WorkerMonitor.lock.Lock()
+	defer m.JobTracker.taskManager.WorkerMonitor.lock.Unlock()
 	m.JobTracker.taskManager.WorkerMonitor.UpdateWorker(args.WorkerMeta)
-	reply.b = true
+	reply.Status = true
 	return nil
 }
 
@@ -90,37 +99,37 @@ const (
 )
 
 type TaskState int
-//when task is in Idle state, the task can be delivered to any workerId specified by master
-//when map task crash in InProgress and Completed state (Caused by health check that the woker machine
-//doesn't work anymore), reset task to Idle state, and the master task scheduler will find another
-//available machine to schedule the task. when reduce task crash in InPogress state reset to idle and
-//the secheduler will do the same work as map schedule, if reduce task is in Completed state, this will
+//when task is in Idle State, the task can be delivered to any workerId specified by master
+//when map task crash in InProgress and Completed State (Caused by health check that the woker machine
+//doesn't work anymore), reset task to Idle State, and the master task scheduler will find another
+//available machine to schedule the task. when reduce task crash in InPogress State reset to idle and
+//the secheduler will do the same work as map schedule, if reduce task is in Completed State, this will
 //not trigger
 const (
-	Idle TaskState=iota
-	InProgress
-	Completed
+	Idle TaskState=0
+	InProgress = 1
+	Completed = 2
 )
 
 type WorkerState int
 
 const (
-	WIdle WorkerState=iota
-	WBusy
-	WError
+	WIdle WorkerState=0
+	WBusy = 1
+	WError = 2
 )
 
 type Workermeta struct {
-	WorkerId string
-	State	WorkerState
-	lastUpdateTime int64
+	WorkerId       string
+	State          WorkerState
+	LastUpdateTime int64
 }
 
 //on worker disabled action
 type WorkerErrorHandler func(workerId string) bool
 
 //JobTracker worker can only process one task JobTracker time
-// WorkerMonitor worker health status and worker state
+// WorkerMonitor worker health status and worker State
 type WorkerMonitor struct{
 	lock	sync.Mutex
 	workers            []Workermeta
@@ -136,37 +145,35 @@ func (w *WorkerMonitor) Exists(workerMeta Workermeta) bool{
 }
 
 func (w *WorkerMonitor) AddNewWorker(workerMeta Workermeta) bool{
-	w.lock.Lock()
-	defer w.lock.Unlock()
 	if w.Exists(workerMeta) {
-		log.Println("worker %v already join master", workerMeta.WorkerId)
+		log.Printf("worker %v already join master\n", workerMeta.WorkerId)
 		return false
 	}
-	if workerMeta.lastUpdateTime == 0 {
-		workerMeta.lastUpdateTime = time.Now().Unix()
+	if workerMeta.LastUpdateTime == 0 {
+		workerMeta.LastUpdateTime = time.Now().Unix()
 	}
 	w.workers = append(w.workers, workerMeta)
 	return true
 }
 
 func (w *WorkerMonitor) UpdateWorker(workerMeta Workermeta) bool{
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	worker := w.GetWorkerByIdForUpdate(workerMeta.WorkerId)
-	if worker != nil {
-		if workerMeta.lastUpdateTime < worker.lastUpdateTime { // the received update information is expired (old information may be due to network lag)
+	worker, i := w.GetWorkerById(workerMeta.WorkerId)
+	if worker.WorkerId != "" {
+		if workerMeta.LastUpdateTime < worker.LastUpdateTime { // the received update information is expired (old information may be due to network lag)
 			return false
 		}
-		worker.State = workerMeta.State
-		worker.lastUpdateTime = workerMeta.lastUpdateTime
+		if worker.State != workerMeta.State {
+			log.Printf("Update worker from state %v to state %v\n", worker.State, workerMeta.State)
+			worker.State = workerMeta.State
+		}
+		worker.LastUpdateTime = workerMeta.LastUpdateTime
+		w.workers[i] = worker
 		return true
 	}
 	return false
 }
 
 func (w *WorkerMonitor) GetWorkersByState(wstate WorkerState)[]Workermeta {
-	w.lock.Lock()
-	defer 	w.lock.Unlock()
 	c := make([]Workermeta, 3)
 	for _, worker := range w.workers {
 		if worker.State == wstate {
@@ -176,25 +183,21 @@ func (w *WorkerMonitor) GetWorkersByState(wstate WorkerState)[]Workermeta {
 	return c // reference or copy value ?
 }
 
-func (w *WorkerMonitor) GetWorkerByIdForUpdate(workerId string ) *Workermeta {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	for _, worker := range w.workers {
+func (w *WorkerMonitor) GetWorkerById(workerId string ) (Workermeta, int) {
+	for i, worker := range w.workers {
 		if worker.WorkerId == workerId {
-			return &worker
+			return worker, i
 		}
 	}
-	return nil
+	return  Workermeta{}, -1
 }
 
 //used by rpc-connection
 func (w *WorkerMonitor) SetWorkerIdle(worker Workermeta){
-	w.lock.Lock()
-	defer w.lock.Unlock()
 	for i, e := range w.workers {
 		if e.WorkerId == worker.WorkerId {
 			e.State = WIdle
-			e.lastUpdateTime = time.Now().Unix()
+			e.LastUpdateTime = time.Now().Unix()
 			w.workers[i] = e
 		}
 	}
@@ -203,12 +206,10 @@ func (w *WorkerMonitor) SetWorkerIdle(worker Workermeta){
 
 //used by rpc-connection
 func (w *WorkerMonitor) SetWorkerError(worker Workermeta){
-	w.lock.Lock()
-	defer w.lock.Unlock()
 	for i, e := range w.workers {
 		if e.WorkerId == worker.WorkerId {
 			e.State = WError
-			e.lastUpdateTime = time.Now().Unix()
+			e.LastUpdateTime = time.Now().Unix()
 			w.workers[i] = e
 		}
 	}
@@ -216,12 +217,11 @@ func (w *WorkerMonitor) SetWorkerError(worker Workermeta){
 
 //used by rpc-connection
 func (w *WorkerMonitor) SetWorkerBusy(worker Workermeta){
-	w.lock.Lock()
-	defer w.lock.Unlock()
+	
 	for i, e := range w.workers {
 		if e.WorkerId == worker.WorkerId {
 			e.State = WBusy
-			e.lastUpdateTime = time.Now().Unix()
+			e.LastUpdateTime = time.Now().Unix()
 			w.workers[i] = e
 		}
 	}
@@ -243,26 +243,26 @@ type TaskLookupTable struct {
 	workerTaskLookupTable map[string][]*TaskInfo
 }
 
-func(w *TaskManager) getAllIntermediateFiles(reduceId int)[]string{
-	w.MapLock.Lock()
-	defer w.MapLock.Unlock()
+// getAllIntermediateFilesBy intermediate files determined by reduce id, file format is mr-taskid-reduceid
+// find intermediate files collected by map phase in the map task and filter filenames with reduceId suffix
+func(w *TaskManager) getAllIntermediateFilesBy(reduceId int)[]string{
 	var filenames []string
 	for _, t := range w.MapTaskTable.taskmeta {
-		f := t.metadata.(MapMetadata).IntermediateFiles[reduceId]
-		filenames = append(filenames, f)
+		mapMeta := toMapMetadata(t.Metadata)
+		for _, fx := range mapMeta.IntermediateFiles {
+			if strings.HasSuffix(fx, strconv.Itoa(reduceId)) {
+				filenames = append(filenames, fx)
+			}
+		}
 	}
 	return filenames
 }
 
 func (w *TaskManager) CompleteMapTask(metadata TaskInfo) bool {
-	w.MapLock.Lock()
-	defer w.MapLock.Unlock()
 	return w.MapTaskTable.CompleteTask(metadata)
 }
 
 func (w *TaskManager) CompleteReduceTask(metadata TaskInfo) bool{
-	w.ReduceLock.Lock()
-	defer w.ReduceLock.Unlock()
 	return w.ReduceTaskTable.CompleteTask(metadata)
 }
 
@@ -276,7 +276,7 @@ func(t *TaskLookupTable) CreateTask(task TaskInfo)  bool{
 func(t *TaskLookupTable) ReleaseAllTask(workerId string)  {
 	if tasks, ok:= t.workerTaskLookupTable[workerId]; ok {
 		for _, tsk := range tasks {
-			tsk.state = Idle
+			tsk.State = Idle
 		}
 		//delete the worker task
 		delete(t.workerTaskLookupTable, workerId)
@@ -287,8 +287,8 @@ func(t *TaskLookupTable) ReleaseAllTask(workerId string)  {
 func(t *TaskLookupTable) ReleaseUnCompleteTask(workerId string)  {
 	if tasks, ok:= t.workerTaskLookupTable[workerId]; ok {
 		for _, tsk := range tasks {
-			if tsk.state != Completed {
-				tsk.state = Idle
+			if tsk.State != Completed {
+				tsk.State = Idle
 			}
 		}
 		//delete the worker task
@@ -297,12 +297,12 @@ func(t *TaskLookupTable) ReleaseUnCompleteTask(workerId string)  {
 }
 
 //pick an idle task and assign to JobTracker worker
-func(t *TaskLookupTable) AssignNewTask(workerId string) (*TaskInfo, bool) {
+func(t *TaskLookupTable) AssignNewTask(workerId string) (TaskInfo, bool) {
 	var task TaskInfo
 	index := -1
 	for i, tsk := range t.taskmeta {
-		if tsk.state == Idle {
-			tsk.state = InProgress
+		if tsk.State == Idle {
+			tsk.State = InProgress
 			task = tsk
 			index = i
 			break
@@ -311,20 +311,20 @@ func(t *TaskLookupTable) AssignNewTask(workerId string) (*TaskInfo, bool) {
 	if index != -1 {
 		t.taskmeta[index] = task
 	} else {
-		return nil, false
+		return TaskInfo{}, false
 	}
 
 	if _, ok := t.workerTaskLookupTable[workerId]; !ok {
 		t.workerTaskLookupTable = map[string][]*TaskInfo{}
 	}
 	t.workerTaskLookupTable[workerId] = append(t.workerTaskLookupTable[workerId], &t.taskmeta[index])
-	return &t.taskmeta[index], true
+	return t.taskmeta[index], true
 }
 
 //update worker task to Idle and reset workerId to ""
 func(t *TaskLookupTable) AllComplete()  bool{
 	for _, tsk := range t.taskmeta {
-		if tsk.state != Completed {
+		if tsk.State != Completed {
 			return false
 		}
 	}
@@ -334,8 +334,8 @@ func(t *TaskLookupTable) AllComplete()  bool{
 func (t *TaskLookupTable) CompleteTask(taskInfo TaskInfo) bool {
 	for i, tsk := range t.taskmeta {
 		if tsk.TaskId == taskInfo.TaskId {
-			tsk.metadata = taskInfo.metadata
-			tsk.state = Completed
+			tsk.Metadata = taskInfo.Metadata
+			tsk.State = Completed
 			t.taskmeta[i] = tsk // update value in taskmeta
 			return true
 		}
@@ -346,8 +346,8 @@ func (t *TaskLookupTable) CompleteTask(taskInfo TaskInfo) bool {
 func (t *TaskLookupTable) setTaskInProgress(taskInfo TaskInfo) {
 	for i, tsk := range t.taskmeta {
 		if tsk.TaskId == taskInfo.TaskId {
-			tsk.metadata = taskInfo.metadata
-			tsk.state = InProgress
+			tsk.Metadata = taskInfo.Metadata
+			tsk.State = InProgress
 			t.taskmeta[i] = tsk // update value in taskmeta
 		}
 	}
@@ -376,52 +376,65 @@ type CompleteTaskReply struct {
 
 //RPC call for client request task, worker now is available and can receive task
 func (m *Master) DoRequestTask(req *RequestTaskRequest, reply *RequestTaskReply) error{
+		log.Printf("request task from %+v in phase %+v \n", req, m.JobTracker.phase)
+	if req.Workermeta.State != WIdle {
+		return nil
+	}
+	log.Printf("accept request from idle worker %+v \n", req.Workermeta.WorkerId)
 	reqWorkerId := req.Workermeta.WorkerId
-
+	m.JobTracker.taskManager.WorkerMonitor.lock.Lock()
+	defer m.JobTracker.taskManager.WorkerMonitor.lock.Unlock()
 	switch m.JobTracker.phase {
 	case PhaseMap :
-		if m.JobTracker.taskManager.WorkerMonitor.GetWorkerByIdForUpdate(reqWorkerId).State != WIdle  {
+		wk, index := m.JobTracker.taskManager.WorkerMonitor.GetWorkerById(reqWorkerId)
+		if index != -1 && wk.State != WIdle  {
 			return nil
 		}
+		m.JobTracker.taskManager.MapLock.Lock()
 		t, ok := m.JobTracker.ScheduleAvailableMapTask(req.Workermeta)
 		if ok {
-			m.JobTracker.taskManager.WorkerMonitor.GetWorkerByIdForUpdate(reqWorkerId).State = WBusy
+			wm, _ := m.JobTracker.taskManager.WorkerMonitor.GetWorkerById(reqWorkerId)
 			reply.Workermeta = Workermeta{
-				WorkerId:       req.Workermeta.WorkerId,
-				State:          0,
-				lastUpdateTime: time.Now().Unix(),
+				WorkerId:        req.Workermeta.WorkerId,
+				State:           wm.State,
+				LastUpdateTime: time.Now().Unix(),
 			}
+			log.Printf("allow map for worker %+v \n", req.Workermeta.WorkerId)
 			reply.Metadata = t
-			return nil
 		} else{
 			reply = &RequestTaskReply{}
 		}
+		m.JobTracker.taskManager.MapLock.Unlock()
+		log.Printf("request task reply %+v\n", reply)
 		return nil
 	case PhaseReduce :
-		if m.JobTracker.taskManager.WorkerMonitor.GetWorkerByIdForUpdate(reqWorkerId).State != WIdle  {
+		wk, index := m.JobTracker.taskManager.WorkerMonitor.GetWorkerById(reqWorkerId)
+		if  index != -1 && wk.State != WIdle  {
 			return nil
 		}
+		m.JobTracker.taskManager.ReduceLock.Lock()
 		t, ok := m.JobTracker.ScheduleAvailableReduceTask(req.Workermeta)
 		if ok {
-			wm := m.JobTracker.taskManager.WorkerMonitor.GetWorkerByIdForUpdate(reqWorkerId)
-			wm.State = WBusy
+			// get new state
+			wm, _ := m.JobTracker.taskManager.WorkerMonitor.GetWorkerById(reqWorkerId)
 			reply.Workermeta = Workermeta{
 				WorkerId:       wm.WorkerId,
 				State:          wm.State,
-				lastUpdateTime: wm.lastUpdateTime,
+				LastUpdateTime: wm.LastUpdateTime,
 			}
+			log.Printf("allow reduce for worker %+v \n", req.Workermeta.WorkerId)
 			reply.Metadata = t
-			return nil
 		} else{
 			reply = &RequestTaskReply{}
 		}
+		m.JobTracker.taskManager.ReduceLock.Unlock()
 		return nil
 	default:
 		return nil
 	}
 }
 
-// listent to the worker state and update worker status periodically
+// listent to the worker State and update worker status periodically
 func (a *AnotherJobTracker) StartWorkerListener(){
 	ticker := time.NewTicker(3000 * time.Millisecond)
 	const MAX_THRESHOLD int64 = 10 * 60 * 1000//10 minutes
@@ -430,11 +443,10 @@ func (a *AnotherJobTracker) StartWorkerListener(){
 	go func() {
 		for {
 			select {
-			case <-a.JobDone:
-				return
 			case <-ticker.C:
+				a.taskManager.WorkerMonitor.lock.Lock()
 				for _, worker := range a.taskManager.WorkerMonitor.workers {
-					if now - worker.lastUpdateTime > MAX_THRESHOLD {
+					if now - worker.LastUpdateTime > MAX_THRESHOLD {
 						if worker.State != WError {
 							//exceed max value
 							a.taskManager.WorkerMonitor.SetWorkerError(worker)
@@ -443,17 +455,19 @@ func (a *AnotherJobTracker) StartWorkerListener(){
 						}
 					}
 				}
+				a.taskManager.WorkerMonitor.lock.Unlock()
 			}
 		}
 	}()
+
 }
 
 type TaskInfo struct {
-	JobId	string
-	TaskId	string
-	Type TaskType
-	state TaskState
-	metadata interface{}
+	JobId    string
+	TaskId   string
+	Type     TaskType
+	State    TaskState
+	Metadata []byte
 }
 
 // meta data for map & reduce task information transform to master
@@ -463,6 +477,50 @@ type MapMetadata struct {
 	NReduce	int32 	// map split intermediate file count
 	Filename string // map source filename
 	IntermediateFiles []string // map generated intermediate files
+}
+
+
+
+func (metadata MapMetadata) toByteBuffer() []byte{
+	var converter bytes.Buffer
+	encoder := gob.NewEncoder(&converter)
+	err := encoder.Encode(metadata)
+	if err != nil {
+		log.Println("encode message error")
+	}
+	return converter.Bytes()
+}
+
+func (metadata ReduceMetadata) toByteBuffer() []byte{
+	var converter bytes.Buffer
+	encoder := gob.NewEncoder(&converter)
+	err := encoder.Encode(metadata)
+	if err != nil {
+		log.Println("encode message error")
+	}
+	return converter.Bytes()
+}
+
+func toMapMetadata(meta []byte) MapMetadata{
+	buffer := bytes.NewBuffer(meta)
+	var m MapMetadata
+	decoder := gob.NewDecoder(buffer)
+	err := decoder.Decode(&m)
+	if err != nil {
+		log.Fatal("decode error")
+	}
+	return m
+}
+
+func toReduceMetadata(meta []byte) ReduceMetadata{
+	buffer := bytes.NewBuffer(meta)
+	var m ReduceMetadata
+	decoder := gob.NewDecoder(buffer)
+	err := decoder.Decode(&m)
+	if err != nil {
+		log.Fatal("decode error")
+	}
+	return m
 }
 
 func (m *MapMetadata) setIntermediateFiles(f []string) {
@@ -479,8 +537,8 @@ type ReduceMetadata struct {
 //only one job is available JobTracker time now
 type AnotherJobTracker struct {
 	JobDone                chan bool
-	MapDone                sync.Once
-	ReduceDone             sync.Once
+	MapDoneSync            sync.Once
+	ReduceDoneSync         sync.Once
 	mapDone                chan bool
 	reduceDone             chan bool
 	jobId                  string
@@ -489,7 +547,7 @@ type AnotherJobTracker struct {
 	numCompleteMapTasks    int32  //current completed map task
 	nReduce                int32
 	numCompleteReduceTasks int32
-	taskManager TaskManager
+	taskManager            TaskManager
 }
 
 func(a *AnotherJobTracker) CompleteOneMapTask() {
@@ -504,8 +562,9 @@ func(a *AnotherJobTracker) AllMapTaskDone() bool {
 	return atomic.CompareAndSwapInt32(&a.numCompleteMapTasks, a.mMap, a.mMap)
 }
 
-func(a *AnotherJobTracker) CompleteOneReduceTask() {
-	atomic.AddInt32(&a.numCompleteReduceTasks, 1)
+func(a *AnotherJobTracker) CompleteOneReduceTask() int32 {
+	remain := atomic.AddInt32(&a.numCompleteReduceTasks, 1)
+	return remain
 }
 
 func(a *AnotherJobTracker) ReduceTaskDone() bool {
@@ -519,44 +578,46 @@ func(a *AnotherJobTracker) Accept(src []string, nReduce int32) {
 }
 
 func (a *AnotherJobTracker) preGenerateMapTasks(src []string, nReduce int32) {
-	//pre generate  map tasks with idle state, waiting for worker to pick
+	//pre generate  map tasks with idle State, waiting for worker to pick
 	for _, s := range src {
 		s := s
 		t := TaskInfo{
 			JobId:  a.jobId,
 			TaskId: Generate().String(),
 			Type:   Map,
-			state:  Idle,
-			metadata: MapMetadata{
+			State:  Idle,
+			Metadata: MapMetadata{
 				NReduce:           nReduce,
 				Filename:          s,
 				IntermediateFiles: []string{},
-			},
+			}.toByteBuffer(),
 		}
 		a.taskManager.MapTaskTable.CreateTask(t)
 		a.mMap++
 	}
+
+	log.Printf("generated map task %+v\n", a.taskManager.MapTaskTable)
 }
 
 func (a *AnotherJobTracker) preGenerateReduceTasks(nReduce int) {
-	//pre generate  map tasks with idle state, waiting for worker to pick
+	//pre generate  map tasks with idle State, waiting for worker to pick
 	for i:= 0; i < nReduce; i++ {
 		t := TaskInfo{
 			JobId:  a.jobId,
 			TaskId: Generate().String(),
 			Type:   Reduce,
-			state:  Idle,
-			metadata: ReduceMetadata{
+			State:  Idle,
+			Metadata: ReduceMetadata{
 				ReduceId:       strconv.Itoa(i),
-				Filenames:      a.taskManager.getAllIntermediateFiles(i),
+				Filenames:      a.taskManager.getAllIntermediateFilesBy(i),
 				ResultFilename: "",
-			},
+			}.toByteBuffer(),
 		}
 		a.taskManager.ReduceTaskTable.CreateTask(t)
 	}
 }
 
-//select JobTracker map task and change state from idle to im-progress
+//select JobTracker map task and change State from idle to im-progress
 func(a *AnotherJobTracker) ScheduleAvailableMapTask(workermeta Workermeta) (TaskInfo, bool) {
 	if a.phase != PhaseMap {
 		return TaskInfo{}, false
@@ -564,11 +625,11 @@ func(a *AnotherJobTracker) ScheduleAvailableMapTask(workermeta Workermeta) (Task
 	t, ok := a.taskManager.MapTaskTable.AssignNewTask(workermeta.WorkerId)
 
 	if !ok {
-		fmt.Println("no job to assigned.")
+		log.Println("no job to assigned.")
 		return TaskInfo{}, false
 	}
 	a.taskManager.WorkerMonitor.SetWorkerBusy(workermeta)
-	v := *t
+	v := t
 	return v, true
 }
 
@@ -580,11 +641,11 @@ func(a *AnotherJobTracker) ScheduleAvailableReduceTask(worker Workermeta) (TaskI
 	t, ok := a.taskManager.ReduceTaskTable.AssignNewTask(worker.WorkerId)
 
 	if !ok {
-		fmt.Println("no job to assigned.")
+		log.Println("no job to assigned.")
 		return TaskInfo{}, false
 	}
 	a.taskManager.WorkerMonitor.SetWorkerBusy(worker)
-	v := *t
+	v := t
 	return v, true
 }
 
@@ -608,7 +669,7 @@ func(a *Master) init() bool {
 
 func (a *AnotherJobTracker) workerErrorHandler() func(workerId string) bool {
 	return func(workerId string) bool {
-		//when the worker is error, set all the task to idle state
+		//when the worker is error, set all the task to idle State
 		if a.phase == PhaseMap {
 			a.taskManager.MapLock.Lock()
 			defer a.taskManager.MapLock.Unlock()
@@ -633,7 +694,7 @@ func MakeMaster(files []string, nReduce int32) *Master {
 	m.init()
 
 	m.JobTracker.Accept(files, nReduce)
-	// listen to the worker state
+	// listen to the worker State
 	go m.JobTracker.StartWorkerListener()	//JobTracker.inputsource = src
 
 	m.server()
@@ -642,13 +703,24 @@ func MakeMaster(files []string, nReduce int32) *Master {
 
 // RPC
 func (m* Master) CompleteMap(args *CompleteTaskRequest, reply *CompleteTaskReply) error {
+	m.JobTracker.taskManager.WorkerMonitor.lock.Lock()
+	m.JobTracker.taskManager.MapLock.Lock()
+
 	m.JobTracker.taskManager.WorkerMonitor.UpdateWorker(args.WorkerMeta)
+	defer func() {
+		m.JobTracker.taskManager.WorkerMonitor.lock.Unlock()
+		m.JobTracker.taskManager.MapLock.Unlock()
+	}()
 	if m.JobTracker.taskManager.CompleteMapTask(args.Metadata) {
 		m.JobTracker.CompleteOneMapTask()
 		if m.JobTracker.AllMapTaskDone() {
-			m.JobTracker.MapDone.Do(func() { //complete map task
+			m.JobTracker.MapDoneSync.Do(func() { //complete map task
 				m.JobTracker.phase = PhaseReduce
-				m.JobTracker.mapDone <- true
+				log.Println("Map task done................................................")
+				log.Println("start reduce task................................................")
+				// do reduce work presign
+				log.Println("pre-generate reduce tasks................................................")
+				m.JobTracker.preGenerateReduceTasks((int)(m.JobTracker.nReduce))
 			})
 		}
 	}
@@ -657,11 +729,19 @@ func (m* Master) CompleteMap(args *CompleteTaskRequest, reply *CompleteTaskReply
 
 //RPC
 func (m* Master) CompleteReduce(args *CompleteTaskRequest, reply *CompleteTaskReply) error {
+	m.JobTracker.taskManager.WorkerMonitor.lock.Lock()
+	m.JobTracker.taskManager.ReduceLock.Lock()
 	m.JobTracker.taskManager.WorkerMonitor.UpdateWorker(args.WorkerMeta)
+	defer func() {
+		m.JobTracker.taskManager.WorkerMonitor.lock.Unlock()
+		m.JobTracker.taskManager.ReduceLock.Unlock()
+	}()
 	if m.JobTracker.taskManager.CompleteReduceTask(args.Metadata) {
-		m.JobTracker.CompleteOneReduceTask()
+		remain := m.JobTracker.CompleteOneReduceTask()
+		log.Printf("remain reduce task %v \n", remain);
 		if m.JobTracker.ReduceTaskDone() {
-			m.JobTracker.ReduceDone.Do(func() { //complete map task
+			log.Printf("reduce task completed. \n");
+			m.JobTracker.ReduceDoneSync.Do(func() { //complete map task
 				m.JobTracker.phase = Result
 				m.JobTracker.reduceDone <- true
 				m.JobTracker.JobDone <- true

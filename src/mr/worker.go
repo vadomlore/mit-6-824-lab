@@ -8,9 +8,9 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -24,9 +24,10 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 var wm = &Workermeta{
 	WorkerId:       Generate().String(),
 	State:          WIdle,
-	lastUpdateTime: time.Now().Unix(),
+	LastUpdateTime: time.Now().Unix(),
 }
 
+var done = make(chan bool) 
 //
 // Map functions return JobTracker slice of KeyValue.
 //
@@ -56,29 +57,29 @@ func ihash(key string) int {
 
 func (w* Workermeta) Update(state WorkerState) Workermeta {
 	w.State = state
-	w.lastUpdateTime = time.Now().Unix()
+	w.LastUpdateTime = time.Now().Unix()
 	nw := *w
 	return nw
 }
 
 func (w* Workermeta) GetNow() Workermeta {
-	w.lastUpdateTime = time.Now().Unix()
+	w.LastUpdateTime = time.Now().Unix()
 	nw := *w
 	return nw
 }
 
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
+	log.Println("start worker.")
 	// Your worker implementation here.
-	args :=  WorkerStatusArgs { WorkerMeta: wm.Update(WBusy)}
-
+	args :=  WorkerStatusArgs { WorkerMeta: wm.GetNow()}
 	reply := JoinMasterReply {}
-
-	if !call("Master.JoinMaster", &args, &reply) {
-		fmt.Println("join master error")
+	succeed := call("Master.JoinMaster", &args, &reply)
+	if  !succeed {
+		log.Printf("join master error.")
 		return
 	}
+	log.Println("join master success")
 
 	// do health check and report to master periodically
 	go func() {
@@ -89,6 +90,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				args := WorkerStatusArgs {wm.GetNow()}
 				reply := ReportStatusReply {}
 				call("Master.ReportStatus", &args, &reply)
+				log.Printf("report worker health status %+v\n", args)
 				//consider when to exit
 			}
 		}
@@ -100,25 +102,31 @@ func Worker(mapf func(string, string) []KeyValue,
 		for {
 			select {
 			case <-ticker.C:
-				if wm.State != WIdle {
-					return
-				}
-				args := RequestTaskRequest {Workermeta: wm.Update(WBusy)}
-				reply := RequestTaskReply {}
-				call("Master.DoRequestTask", &args, &reply)
-				if reply.Metadata.JobId != "" && reply.Metadata.Type == Map{
-					DoMap(mapf, reply.Metadata)
-				} else if reply.Metadata.JobId != "" && reply.Metadata.Type == Reduce {
-					DoReduce(reducef, reply.Metadata)
+				log.Printf("check for map-reduce environment wm.State=%v\n", wm.State)
+				if wm.State == WIdle {
+					args := RequestTaskRequest {Workermeta: wm.GetNow()}
+					reply := RequestTaskReply {}
+					log.Println("start request job.")
+					call("Master.DoRequestTask", &args, &reply)
+					if reply.Metadata.JobId != "" && reply.Metadata.Type == Map {
+						log.Printf("start map task reply meta data %+v \n.", reply.Metadata)
+						DoMap(mapf, reply.Metadata)
+					} else if reply.Metadata.JobId != "" && reply.Metadata.Type == Reduce {
+						log.Println("start reduce task.")
+						DoReduce(reducef, reply.Metadata)
+					}
 				}
 			}
 		}
 	}()
+	log.Println("worker serve.")
+	<- done
 }
 
 func DoReduce(reducef func(string, []string) string, info TaskInfo) {
 	wm.Update(WBusy)
-	metadata := info.metadata.(ReduceMetadata)
+	log.Println("start reduce work.")
+	metadata := toReduceMetadata(info.Metadata)
 	intermediate := make([]KeyValue, 100)
 	for _, f := range metadata.Filenames {
 		kv := load(f)
@@ -150,11 +158,13 @@ func DoReduce(reducef func(string, []string) string, info TaskInfo) {
 	}
 
 	ofile.Close()
-	info.state = Completed
+	info.State = Completed
 	metadata.ResultFilename = oname
+	wm.Update(WIdle)
+	info.Metadata = metadata.toByteBuffer()
 	args :=  CompleteTaskRequest{WorkerMeta: wm.GetNow(), Metadata: info}
 	reply :=  CompleteTaskReply{}
-	wm.Update(WIdle)
+	log.Printf("reduce part %v complete.\n", metadata.ReduceId)
 	//report reduce task complete
 	call("Master.CompleteReduce", &args, &reply)
 }
@@ -162,12 +172,15 @@ func DoReduce(reducef func(string, []string) string, info TaskInfo) {
 
 func DoMap(mapf func(string, string) []KeyValue, info TaskInfo ) {
 	wm.Update(WBusy)
-	metadata := info.metadata.(MapMetadata)
+	log.Println("start doing map.")
+	metadata := toMapMetadata(info.Metadata)
+	//log.Println("metadata %+v", metadata)
 	file, err := os.Open(metadata.Filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", metadata.Filename)
 	}
 	content, err := ioutil.ReadAll(file)
+	//log.Println("Content: %v", content)
 	if err != nil {
 		log.Fatalf("cannot read %v", metadata.Filename)
 	}
@@ -175,27 +188,32 @@ func DoMap(mapf func(string, string) []KeyValue, info TaskInfo ) {
 	kva := mapf(metadata.Filename, string(content))
 
 	m1 := make(map[int][]KeyValue)
-
+	//log.Println("map kva result: %v", kva)
 	for _, kv := range kva {
 		partition := ihash(kv.Key) % (int)(metadata.NReduce)
 		value, ok := m1[partition]
 		if !ok {
 			value = make([]KeyValue, 10)
+			m1[partition] = value
 		}
-		value = append(value, kv)
+		m1[partition] = append(m1[partition], kv)
 	}
-	intermediates := make([]string, 0)
-
+	//log.Printf("partition kva result: %+v\n", m1)
+	intermediates := make([]string, 10)
 	for reduceId, kv := range m1 {
 		im := store(kv, info.TaskId, strconv.Itoa(reduceId))
 		intermediates = append(intermediates, im)
 	}
 	//report Map task complete
-	info.state = Completed
+	info.State = Completed
 	metadata.IntermediateFiles = intermediates
+	info.Metadata = metadata.toByteBuffer()
+	wm.Update(WIdle)
 	args :=  CompleteTaskRequest{WorkerMeta: wm.GetNow(), Metadata: info}
 	reply :=  CompleteTaskReply{}
-	wm.Update(WIdle)
+	log.Printf("map intermediates result %v\n", intermediates)
+	//log.Printf("map result %+v\n", info)
+	//log.Printf("map complete rpc %+v\n", args)
 	call("Master.CompleteMap", &args, &reply)
 	
 }
@@ -219,7 +237,7 @@ func CallExample() {
 	call("Master.Example", &args, &reply)
 
 	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	log.Printf("reply.Y %v\n", reply.Y)
 }
 
 //
@@ -241,26 +259,36 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	log.Println(err)
 	return false
 }
 
 // store intermediate data to disk with format mr-X-Y
 // X is map task id and y is reduce task id
 func store(kva []KeyValue, mapTaskId string, reduceTaskId string) string{
-	fileInfos, err := ioutil.ReadDir(".")
+	const tempDir = "/usr/local/map-reduce-task/data/temp"
+	_, err := ioutil.ReadDir(tempDir)
 	if err != nil {
-		log.Fatal("error read file")
-	}
-	for _, v := range fileInfos {
-		if !v.IsDir() && strings.HasPrefix(v.Name(), "mr-tmp-") {
-			err := os.Remove(v.Name())
-			if err != nil {
-				log.Fatal("remove temporary file error %v", v.Name)
-			}
+		log.Printf("dir not exists with err %v, create one \n", err)
+		err := os.MkdirAll(tempDir, os.ModePerm)
+		if err != nil {
+			log.Fatalf("create file error %v\n", err)
 		}
 	}
-	f, err := ioutil.TempFile("", "mr-tmp-")
+	//for _, v := range fileInfos {
+	//	if !v.IsDir() && strings.HasPrefix(v.Name(), "mr-tmp-") {
+	//		err := os.Remove(v.Name())
+	//		if err != nil {
+	//			log.Fatal("remove temporary file error %v", v.Name)
+	//		}
+	//	}
+	//}
+
+	tempFileName := "mr-tmp-" + mapTaskId + "-" + reduceTaskId
+	f, err := os.Create(path.Join(tempDir, tempFileName))
+	if err != nil {
+		log.Fatalf("create temporary file error %v \n", err)
+	}
 	enc := json.NewEncoder(f)
 	for _, kv := range kva {
 		err := enc.Encode(&kv)
@@ -268,8 +296,10 @@ func store(kva []KeyValue, mapTaskId string, reduceTaskId string) string{
 			log.Fatal("store data to  file %v error.", f.Name())
 		}
 	}
-	permnateIntermediateFile := ".\\" + "mr-" + mapTaskId + "-" + reduceTaskId
-	os.Rename(f.Name(), permnateIntermediateFile)
+	permnateIntermediateFile := "mr-" + mapTaskId + "-" + reduceTaskId
+	log.Printf("file oldname: %v, newname: %v.\n", f.Name(), permnateIntermediateFile)
+	os.Rename(f.Name(), path.Join(tempDir, permnateIntermediateFile))
+	permnateIntermediateFile = path.Join(tempDir, permnateIntermediateFile)
 	return permnateIntermediateFile
 }
 
@@ -279,7 +309,7 @@ func load(filename string) []KeyValue {
 	kva := make([]KeyValue, 100)
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal("load data to  memory failed, file %v not exists.", filename)
+		log.Fatalf("load data to  memory failed, file %v not exists.\n", filename)
 	}
 
 	dec := json.NewDecoder(file)

@@ -422,7 +422,8 @@ func (m *Master) DoRequestTask(req *RequestTaskRequest, reply *RequestTaskReply)
 				State:          wm.State,
 				LastUpdateTime: wm.LastUpdateTime,
 			}
-			log.Printf("allow reduce for worker %+v \n", req.Workermeta.WorkerId)
+
+			log.Printf("allow reduce for worker %+v  taskId %+v.\n", req.Workermeta.WorkerId, reply.Metadata.TaskId)
 			reply.Metadata = t
 		} else{
 			reply = &RequestTaskReply{}
@@ -563,8 +564,8 @@ func(a *AnotherJobTracker) AllMapTaskDone() bool {
 }
 
 func(a *AnotherJobTracker) CompleteOneReduceTask() int32 {
-	remain := atomic.AddInt32(&a.numCompleteReduceTasks, 1)
-	return remain
+	numCompleted := atomic.AddInt32(&a.numCompleteReduceTasks, 1)
+	return numCompleted
 }
 
 func(a *AnotherJobTracker) ReduceTaskDone() bool {
@@ -737,8 +738,8 @@ func (m* Master) CompleteReduce(args *CompleteTaskRequest, reply *CompleteTaskRe
 		m.JobTracker.taskManager.ReduceLock.Unlock()
 	}()
 	if m.JobTracker.taskManager.CompleteReduceTask(args.Metadata) {
-		remain := m.JobTracker.CompleteOneReduceTask()
-		log.Printf("remain reduce task %v \n", remain);
+		completed := m.JobTracker.CompleteOneReduceTask()
+		log.Printf("completed reduce task %v \n", completed);
 		if m.JobTracker.ReduceTaskDone() {
 			log.Printf("reduce task completed. \n");
 			m.JobTracker.ReduceDoneSync.Do(func() { //complete map task

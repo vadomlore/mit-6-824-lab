@@ -60,10 +60,10 @@ func spawn_clients_and_wait(t *testing.T, cfg *config, ncli int, fn func(me int,
 		ca[cli] = make(chan bool)
 		go run_client(t, cfg, cli, ca[cli], fn)
 	}
-	// log.Printf("spawn_clients_and_wait: waiting for clients")
+	log.Printf("spawn_clients_and_wait: waiting for clients")
 	for cli := 0; cli < ncli; cli++ {
 		ok := <-ca[cli]
-		// log.Printf("spawn_clients_and_wait: client %d is done\n", cli)
+		log.Printf("spawn_clients_and_wait: client %d is done\n", cli)
 		if ok == false {
 			t.Fatalf("failure")
 		}
@@ -192,7 +192,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		clnts[i] = make(chan int)
 	}
 	for i := 0; i < 3; i++ {
-		// log.Printf("Iteration %v\n", i)
+		log.Printf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
@@ -204,20 +204,23 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			key := strconv.Itoa(cli)
 			Put(cfg, myck, key, last)
 			for atomic.LoadInt32(&done_clients) == 0 {
+				log.Printf("load done_client %v", atomic.LoadInt32(&done_clients))
+
 				if (rand.Int() % 1000) < 500 {
 					nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					// log.Printf("%d: client new append %v\n", cli, nv)
+					log.Printf("%d: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv)
 					last = NextValue(last, nv)
 					j++
 				} else {
-					// log.Printf("%d: client new get %v\n", cli, key)
+					log.Printf("%d: client new get %v\n", cli, key)
 					v := Get(cfg, myck, key)
 					if v != last {
 						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
 					}
 				}
 			}
+			log.Printf("exit client j %v", j)
 		})
 
 		if partitions {
@@ -225,13 +228,13 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			time.Sleep(1 * time.Second)
 			go partitioner(t, cfg, ch_partitioner, &done_partitioner)
 		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 
 		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
-
+		log.Println("Quit client.")
 		if partitions {
-			// log.Printf("wait for partitioner\n")
+			log.Printf("wait for partitioner\n")
 			<-ch_partitioner
 			// reconnect network and submit a request. A client may
 			// have submitted a request in a minority.  That request
@@ -258,15 +261,16 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			cfg.ConnectAll()
 		}
 
-		// log.Printf("wait for clients\n")
+		log.Printf("wait for clients\n")
+
 		for i := 0; i < nclients; i++ {
-			// log.Printf("read from clients %d\n", i)
+			log.Printf("read from clients %d\n", i)
 			j := <-clnts[i]
-			// if j < 10 {
-			// 	log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
-			// }
+			if j < 10 {
+				log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
+			}
 			key := strconv.Itoa(i)
-			// log.Printf("Check %v for client %d\n", j, i)
+			log.Printf("Check %v for client %d\n", j, i)
 			v := Get(cfg, ck, key)
 			checkClntAppends(t, i, v, j)
 		}
@@ -341,6 +345,7 @@ func GenericTestLinearizability(t *testing.T, part string, nclients int, nserver
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
 			j := 0
 			defer func() {
+				log.Printf("client %v exit.", j)
 				clnts[cli] <- j
 			}()
 			for atomic.LoadInt32(&done_clients) == 0 {
@@ -368,6 +373,8 @@ func GenericTestLinearizability(t *testing.T, part string, nclients int, nserver
 				operations = append(operations, op)
 				opMu.Unlock()
 			}
+			log.Printf("done client %v.", j)
+
 		})
 
 		if partitions {

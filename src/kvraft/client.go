@@ -1,13 +1,16 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	cachedLeaderIndex int
 }
 
 func nrand() int64 {
@@ -37,8 +40,41 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
+	getArgs := GetArgs{
+		Key: key,
+	}
+	for {
+		reply := GetReply{}
+		DPrintf("[client:]Send to server peer-%v Get %v", ck.cachedLeaderIndex, getArgs)
+		done := make(chan bool, 1)
+		go func() {
+			ok := ck.servers[ck.cachedLeaderIndex].Call("KVServer.Get", &getArgs, &reply)
+			done <- ok
+		}()
+
+		select {
+		case <-time.After(200 * time.Millisecond):
+			{
+				ck.cachedLeaderIndex = (ck.cachedLeaderIndex + 1) % len(ck.servers)
+				continue
+			}
+		case ok := <-done:
+			{
+				if ok && reply.Err != ErrWrongLeader {
+					if reply.Err == OK {
+						goto EXIT
+					}
+				}
+				if reply.Err == ErrWrongLeader {
+					ck.cachedLeaderIndex = (ck.cachedLeaderIndex + 1) % len(ck.servers)
+					continue
+				}
+			}
+		}
+	EXIT:
+		return reply.Value
+	}
 	return ""
 }
 
@@ -54,6 +90,43 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}
+	for {
+		reply := PutAppendReply{}
+		DPrintf("[client:]Send to server peer-%v PutAppend %v", ck.cachedLeaderIndex, args)
+		done := make(chan bool, 1)
+		go func() {
+			ok := ck.servers[ck.cachedLeaderIndex].Call("KVServer.PutAppend", &args, &reply)
+			done <- ok
+		}()
+
+		select {
+		case <-time.After(200 * time.Millisecond):
+			{
+				ck.cachedLeaderIndex = (ck.cachedLeaderIndex + 1) % len(ck.servers)
+				continue
+			}
+		case ok := <-done:
+			{
+				if ok && reply.Err != ErrWrongLeader {
+					if reply.Err == OK {
+						ck.cachedLeaderIndex = (ck.cachedLeaderIndex + 1) % len(ck.servers)
+						goto EXIT
+					}
+				}
+				if reply.Err == ErrWrongLeader {
+					ck.cachedLeaderIndex = (ck.cachedLeaderIndex + 1) % len(ck.servers)
+					continue
+				}
+			}
+		}
+	EXIT:
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

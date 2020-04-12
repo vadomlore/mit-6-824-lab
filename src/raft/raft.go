@@ -88,6 +88,7 @@ type Raft struct {
 	//volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed(init to 0)
 
+
 	lastApplied int // index of highest log entry known to be applied to state machine(init to 0)
 
 	//volatile state on leaders
@@ -97,6 +98,8 @@ type Raft struct {
 
 	lastResponseTime int64 //rpc last response time
 	resetTimer       chan bool
+	applyCount	int32
+	lockCounter int32
 }
 
 // return currentTerm and whether this server
@@ -306,10 +309,15 @@ func (rf *Raft) GetLogStoreIndex(index int) int {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//now := time.Now().UnixNano()
+	atomic.AddInt32(&rf.lockCounter, 1)
+	DPrintf("[lock:RequestVote] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	defer func(r *RequestVoteReply) {
 		DPrintf("[peer-%v:%v] give my vote to %v in candidateTerm[%v] with myTerm[%v]===>result:%v.\n", rf.me, rf.GetRoleName(), args.CandidateId, args.Term, rf.currentTerm, r.VoteGranted)
+		atomic.AddInt32(&rf.lockCounter, -1)
+		DPrintf("[unlock:RequestVote] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+		rf.mu.Unlock()
 	}(reply)
 	DPrintf("peer->%v[%v] give my vote to %v in candidateTerm[%v] with myTerm[%v]?\n", rf.me, rf.GetRoleName(), args.CandidateId, args.Term, rf.currentTerm)
 
@@ -346,7 +354,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			if rf.lastResponseTime < now {
-				rf.lastResponseTime = now
+				atomic.StoreInt64(&rf.lastResponseTime, now)
 			}
 		} else {
 			reply.VoteGranted = false //already vote
@@ -358,7 +366,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			if rf.lastResponseTime < now {
-				rf.lastResponseTime = now
+				atomic.StoreInt64(&rf.lastResponseTime, now)
 			}
 		} else {
 			reply.VoteGranted = false //already vote
@@ -430,14 +438,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.GetLastLogEntry().Index + 1
 	term = rf.currentTerm
 
-	log := LogEntry{
+	_log := LogEntry{
 		Index:   index,
 		Term:    term,
 		Command: command,
 	}
 
-	//DPrintf("Before append command fom peer-%v,  cmd:%v, rfLog %v\n", rf.me, log, rf.log)
-	rf.log = append(rf.log, log)
+	DPrintf("NewCommand: %#v, len[%v], Current commitIndex[%v], current applyIndex:[%v]\n\n", _log, len(rf.log) - 1, rf.commitIndex, rf.lastApplied)
+	rf.log = append(rf.log, _log)
 	rf.SaveRaftState(RaftState{
 		CurrentTerm: rf.currentTerm,
 		VotedFor:    rf.votedFor,
@@ -517,7 +525,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = -1
 	}
 
-	rf.lastResponseTime = time.Now().UnixNano()
+	atomic.StoreInt64(&rf.lastResponseTime, time.Now().UnixNano())
 
 	// initialize from state persisted before a crash
 	gob.Register(RaftState{})
@@ -552,21 +560,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	now := time.Now().UnixNano()
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	DPrintf("peer-%v Receive msg args %#v, myTerm[%v] voted:%v", rf.me, args, rf.currentTerm, rf.votedFor)
-	defer rf.SaveRaftState(RaftState{
-		CurrentTerm: rf.currentTerm,
-		VotedFor:    rf.votedFor,
-		Log:         rf.log,
-	})
 
+	atomic.AddInt32(&rf.lockCounter, 1)
+	DPrintf("[RPC AppendEntries lock] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+	rf.mu.Lock()
+	defer func() {
+		atomic.AddInt32(&rf.lockCounter, -1)
+		DPrintf("[RPC AppendEntries unlock] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+		rf.mu.Unlock()
+	}()
+
+	DPrintf("[RPC AppendEntries:] peer-%v Receive msg args %#v, myTerm[%v]", rf.me, args, rf.currentTerm)
 
 	//If AppendEntries RPC received from new leader: convert to
 	//follower
 	if rf.role == CANDIDATE {
 		rf.TransformToFollower()
 	}
+	changed := false
 
 	reply.Term = args.Term
 	if reply.Term < rf.currentTerm {
@@ -579,17 +590,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//reply false if term < currentTerm §5.1
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+
 		return
 	} else if args.Term > rf.currentTerm {
 		DPrintf("%v try to convert  to FOLLOWER", rf.me)
 		rf.currentTerm = args.Term
 		if rf.lastResponseTime < now {
-			rf.lastResponseTime = now
+			atomic.StoreInt64(&rf.lastResponseTime, now)
 		}
+		changed = true
 		rf.TransformToFollower()
+
 	} else if args.Term == rf.currentTerm {
 		if rf.lastResponseTime < now { //reset heart beat timer
-			rf.lastResponseTime = now
+			atomic.StoreInt64(&rf.lastResponseTime, now)
 		}
 	}
 
@@ -611,18 +625,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.MergeLog(args.Entries)
 		DPrintf("peer-%v Receive new log: new log[%v], entries [%v]", rf.me, rf.log, args.Entries)
 		reply.Success = true
+		changed = true
 	}
 
 	//5
 	if args.LeaderCommit > rf.commitIndex {
+		changed = true
+		oldIndex := rf.commitIndex
 		DPrintf("Try Update commit index rf.commitIndex[%v] args.LeaderCommit[%v] lastEntry.Index %v ", rf.commitIndex, args.LeaderCommit, rf.GetLastLogEntry().Index)
 		rf.commitIndex = args.LeaderCommit
 		if rf.GetLastLogEntry().Index < args.LeaderCommit {
 			rf.commitIndex = rf.GetLastLogEntry().Index
-			DPrintf("UpdateCommitIndex [Follower-%v] commitIndex %v\n", rf.me, rf.commitIndex)
+		}
+		if oldIndex != rf.commitIndex {
+			DPrintf(" [peer-%v %v] UpdateCommitIndex from [%v] to [%v].\n", rf.me, rf.GetRoleName(), oldIndex, rf.commitIndex)
 		}
 	}
-	return
+
+	if changed {
+		rf.SaveRaftState(RaftState{
+			CurrentTerm: rf.currentTerm,
+			VotedFor:    rf.votedFor,
+			Log:         rf.log,
+		})
+	}
+	DPrintf("[RPC AppendEntries unlock] peer-%v-lock]", rf.me)
 }
 
 func (rf *Raft) GetRoleName() string {
@@ -643,11 +670,16 @@ func GetRoleName(role Role) string {
 }
 
 func (rf *Raft) DoNextRoundElection() {
+	atomic.AddInt32(&rf.lockCounter, 1)
+	DPrintf("[lock:DoNextRoundElection] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 	rf.mu.Lock()
 	role := rf.role
 	var term int
 	var candidate string
 	if role == LEADER {
+		atomic.AddInt32(&rf.lockCounter, -1)
+		DPrintf("[unlock:DoNextRoundElection] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+		rf.mu.Unlock()
 		return
 		log.Fatalf("invalid transition %v->%v.\n", GetRoleName(LEADER), GetRoleName(CANDIDATE))
 	}
@@ -667,7 +699,7 @@ func (rf *Raft) DoNextRoundElection() {
 		Log:         rf.log,
 	})
 	term = rf.currentTerm
-	rf.lastResponseTime = time.Now().Unix()
+	atomic.StoreInt64(&rf.lastResponseTime, time.Now().Unix())
 	candidate = strconv.Itoa(rf.me)
 	var lastLogIndex, lastLogTerm int
 
@@ -686,21 +718,29 @@ func (rf *Raft) DoNextRoundElection() {
 	majorCount := len(rf.peers)/2 + 1
 	totalPeer := len(rf.peers)
 
+	atomic.AddInt32(&rf.lockCounter, -1)
+	DPrintf("[unlock:DoNextRoundElection] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+
 	rf.mu.Unlock()
 	rf.DoElection(role, &req, majorCount, totalPeer)
 }
 
 func (rf *Raft) DoElection(role Role, req *RequestVoteArgs, majorCount int, totalPeer int) {
 	//vote for myself
+	atomic.AddInt32(&rf.lockCounter, 1)
+	DPrintf("[lock:DoElection] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 	rf.mu.Lock()
-	voteCount := 1
-	finished := 1
+
+	voteCount := int32(1)
+	finished := int32(1)
 	rf.votedFor = strconv.Itoa(rf.me)
 	rf.SaveRaftState(RaftState{
 		CurrentTerm: rf.currentTerm,
 		VotedFor:    rf.votedFor,
 		Log:         rf.log,
 	})
+	atomic.AddInt32(&rf.lockCounter, -1)
+	DPrintf("[unlock:DoElection-1] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 	rf.mu.Unlock()
 	//send rpc to request vote from other peer
 	cond := sync.NewCond(&rf.mu)
@@ -710,12 +750,17 @@ func (rf *Raft) DoElection(role Role, req *RequestVoteArgs, majorCount int, tota
 			go func(index int) {
 				reply := RequestVoteReply{}
 				DPrintf("[role:%v %v]---requestVote--->%v.\n", GetRoleName(role), rf.me, index)
+
 				rf.sendRequestVote(index, req, &reply)
+				atomic.AddInt32(&rf.lockCounter, 1)
+				DPrintf("[lock:DoElection] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 				rf.mu.Lock()
-				finished++
+
+				//finished++
+				atomic.AddInt32(&finished, 1)
 				if req.Term == reply.Term && req.Term == rf.currentTerm && reply.VoteGranted {
-					voteCount = voteCount + 1
-					DPrintf("%v<---vote---%v.\n", rf.me, reply.VoterId)
+					atomic.AddInt32(&voteCount, 1)
+					//DPrintf("%v<---vote---%v.\n", rf.me, reply.VoterId)
 				} else if rf.currentTerm < reply.Term { //current state stale
 					rf.currentTerm = reply.Term
 					rf.TransformToFollower()
@@ -725,31 +770,41 @@ func (rf *Raft) DoElection(role Role, req *RequestVoteArgs, majorCount int, tota
 						Log:         rf.log,
 					})
 				}
+				atomic.AddInt32(&rf.lockCounter, -1)
+				DPrintf("[unlock:DoElection] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 				rf.mu.Unlock()
 				cond.Broadcast()
 			}(iPeer)
 		}
 	}
 	cond.L.Lock()
-	for voteCount < majorCount && finished != totalPeer {
+	for atomic.LoadInt32(&voteCount) < int32(majorCount) && atomic.LoadInt32(&finished) != int32(totalPeer) {
 		cond.Wait()
 	}
 	cond.L.Unlock()
 
-	if voteCount >= majorCount { //majority agree this peer to be leader, and must test role is CANDIDATE
+	if atomic.LoadInt32(&voteCount) >= int32(majorCount) { //majority agree this peer to be leader, and must test role is CANDIDATE
+		atomic.AddInt32(&rf.lockCounter, 1)
+		DPrintf("[lock:DoElection] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 		rf.mu.Lock()
+
 		DPrintf("Election succeed:[Leader-%v] in term [%v]!!!.\n", rf.me, rf.currentTerm)
 		if rf.role != CANDIDATE {
+			atomic.AddInt32(&rf.lockCounter, -1)
+			DPrintf("[unlock:DoElection] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+			rf.mu.Unlock()
 			return
-			log.Fatalf("peer-%v invalid transition %v->%v.\n", rf.me, GetRoleName(rf.role), GetRoleName(LEADER))
+			//log.Fatalf("peer-%v invalid transition %v->%v.\n", rf.me, GetRoleName(rf.role), GetRoleName(LEADER))
 		}
 		rf.role = LEADER
 		rf.ReinitializeIndexes()
 		DPrintf("[Leader %v] nextIndex %v, matchIndex %v,  .\n", rf.me, rf.nextIndex, rf.matchIndex)
 		rf.AppendEntriesLoop()
+		atomic.AddInt32(&rf.lockCounter, -1)
+		DPrintf("[unlock:DoElection] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 		rf.mu.Unlock()
 	}
-	if voteCount < majorCount {
+	if atomic.LoadInt32(&voteCount) < int32(majorCount) {
 		DPrintf("voteCount %v,  split brain (%v) finished %v.\n", voteCount, rf.me, finished)
 	}
 }
@@ -762,29 +817,6 @@ func (rf *Raft) TransformToFollower() {
 	}
 }
 
-//// todo candidate transfer to follower should reset electionTimeout?
-//func (rf *Raft) TransitionFromCandidateToFollower() {
-//	rf.mu.Lock()
-//	defer rf.mu.Unlock()
-//	if rf.role != CANDIDATE {
-//		return
-//	}
-//	rf.role = FOLLOWER
-//}
-//
-//func (rf *Raft) TransitionFromLeaderToFollower() {
-//	rf.mu.Lock()
-//	defer rf.mu.Unlock()
-//	if rf.role != LEADER {
-//		return
-//	}
-//	oldRole := rf.role
-//	rf.role = FOLLOWER
-//
-//	DPrintf("%v Role Transfer [%v --> %v]\n", rf.me, GetRoleName(oldRole), rf.GetRoleName())
-//	rf.ElectionLoop()
-//}
-
 func RandPeriod() time.Duration {
 	rand.Seed(time.Now().UnixNano())
 	rand := 150*time.Millisecond + time.Duration(rand.Intn(150))*time.Millisecond
@@ -793,14 +825,10 @@ func RandPeriod() time.Duration {
 
 //everytime call this method will restart the election process
 func (rf *Raft) ElectionLoop() {
-
 	go func() {
 		period := RandPeriod()
 		DPrintf("%v start election loop period %v.\n", rf.me, period)
-		for {
-			if rf.killed() {
-				return
-			}
+		for !rf.killed(){
 			if _, isLeader := rf.GetState(); isLeader {
 				return
 			}
@@ -815,7 +843,8 @@ func (rf *Raft) ElectionLoop() {
 			}
 
 			nano := time.Now().UnixNano()
-			if nano-rf.lastResponseTime > period.Nanoseconds() {
+			expire := nano-atomic.LoadInt64(&rf.lastResponseTime) > period.Nanoseconds()
+			if expire {
 				// timeout
 				DPrintf("%v election loop timeout.\n", rf.me)
 				period = RandPeriod()
@@ -830,7 +859,7 @@ func (rf *Raft) AppendEntriesLoop() {
 	const heartBeatInterval = time.Duration(120) * time.Millisecond
 	DPrintf("peer-%v start heart beat with interval %v.\n", rf.me, heartBeatInterval)
 	go func() {
-		for {
+		for !rf.killed() {
 			if _, isLeader := rf.GetState(); !isLeader {
 				return
 			}
@@ -844,6 +873,7 @@ func (rf *Raft) AppendEntriesLoop() {
 }
 
 func (rf *Raft) AppendLogEntries() {
+
 	rf.mu.Lock()
 	totalPeer := len(rf.peers)
 	rf.nextIndex[rf.me] = rf.GetLastLogEntry().Index + 1 //update leader's nextIndex index
@@ -852,109 +882,99 @@ func (rf *Raft) AppendLogEntries() {
 
 	for iPeer := 0; iPeer < totalPeer; iPeer++ {
 		if iPeer != rf.me {
-			go func(index int) {
-				rf.RetryableAppendLogEntries(index) // closure should not use iPeer here, otherwise it would produce error
+			go func(index int) { // send rpc command
+
+				for !rf.killed() {
+					_, isLeader := rf.GetState()
+					if !isLeader {
+						break
+					}
+					atomic.AddInt32(&rf.lockCounter, 1)
+					DPrintf("[lock:AppendLogEntries-1] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+					rf.mu.Lock()
+					if rf.nextIndex[index] <= 1 {
+						rf.nextIndex[index] = 1
+					}
+					req := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: rf.GetEntryByLogIndex(rf.nextIndex[index] - 1).Index,
+						PrevLogTerm:  rf.GetEntryByLogIndex(rf.nextIndex[index] - 1).Term,
+						Entries:      rf.log[rf.nextIndex[index]:],
+						LeaderCommit: rf.commitIndex,
+					}
+					//DPrintf("Suppose[Leader] peer-%v is  with LeaderLog[%v] in [term:%v] send to peer-%v, nextLogIndex[%v] matchIndex[%v], req=%#v\n", rf.me, rf.log, rf.currentTerm, index, rf.nextIndex, rf.matchIndex, req)
+					DPrintf("[Leader %v] send rpc to peer-%v, nextLogIndex[%v] matchIndex[%v], req=%#v\n", rf.me, index, rf.nextIndex, rf.matchIndex, req)
+					reply := AppendEntriesReply{}
+					atomic.AddInt32(&rf.lockCounter, -1)
+					DPrintf("[unlock:AppendLogEntries-1] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+					rf.mu.Unlock()
+
+
+					done := make(chan bool)
+					go func() {
+						ok := rf.sendAppendEntries(index, &req, &reply)
+						done <- ok
+					}()
+					<- done
+
+					DPrintf("peer-%v recv reply from peer-%v in term [%v] req:%#v, res:%#v\n", rf.me, index, rf.currentTerm, req, reply)
+					atomic.AddInt32(&rf.lockCounter, 1)
+					DPrintf("[lock:AppendLogEntries-2] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+					rf.mu.Lock()
+
+					if rf.role != LEADER {
+						atomic.AddInt32(&rf.lockCounter, -1)
+						DPrintf("[lock:AppendLogEntries-2] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+						rf.mu.Unlock()
+						break
+					}
+					if reply.Term > rf.currentTerm {
+						DPrintf("transfer to follower reply Term %v, currentTerm:%v", reply.Term, rf.currentTerm)
+						rf.currentTerm = reply.Term
+						rf.SaveRaftState(RaftState{
+							CurrentTerm: rf.currentTerm,
+							VotedFor:    rf.votedFor,
+							Log:         rf.log,
+						})
+						rf.TransformToFollower()
+						atomic.AddInt32(&rf.lockCounter, -1)
+						DPrintf("[lock:AppendLogEntries-2] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+						rf.mu.Unlock()
+						break
+					}
+					if rf.currentTerm != req.Term {
+						DPrintf("something odd happened currentTerm %v, replyTerm %v", rf.currentTerm, reply.Term)
+						atomic.AddInt32(&rf.lockCounter, -1)
+						DPrintf("[lock:AppendLogEntries-2] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+						rf.mu.Unlock()
+						break
+					}
+					if req.Term == reply.Term && req.Term == rf.currentTerm {
+						if reply.Success {
+							rf.nextIndex[index] = rf.GetLastLogEntry().Index + 1
+							rf.matchIndex[index] = req.PrevLogIndex + len(req.Entries)
+							DPrintf("==>[peer-%v reply success:] nextIndex[%v] matchIndex[%v] total matchIndex(%v).\n", index, rf.nextIndex[index], rf.matchIndex[index], rf.matchIndex)
+							_ = rf.UpdateCommitIndex()
+						} else {
+							//				if rf.nextIndex[index] >= 1 { //why only contains == 1 here pass the test ?
+							rf.nextIndex[index]--
+							//				}
+						}
+					}
+					additionalLogEntry := rf.GetLastLogEntry().Index >= rf.nextIndex[index]
+					if !additionalLogEntry {
+						atomic.AddInt32(&rf.lockCounter, -1)
+						DPrintf("[lock:AppendLogEntries-2] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+						rf.mu.Unlock()
+						break
+					}
+					atomic.AddInt32(&rf.lockCounter, -1)
+					DPrintf("[lock:AppendLogEntries-2] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
+					rf.mu.Unlock()
+				}
 			}(iPeer)
 		}
-	}
-}
-
-func (rf *Raft) RetryableAppendLogEntries(index int) {
-	//additionalLogEntry := rf.GetLastLogEntry().Index >= rf.nextIndex[index]
-	//prevIndex, prevTerm := rf.GetPrevLogIndicator()
-	//term := rf.currentTerm
-	//leaderId := rf.me
-	//req := AppendEntriesArgs{
-	//	Term:         term,
-	//	LeaderId:     leaderId,
-	//	PrevLogIndex: prevIndex,
-	//	PrevLogTerm:  prevTerm,
-	//	Entries:      make([]LogEntry, 0),
-	//	LeaderCommit: rf.commitIndex,
-	//}
-
-	//rf.mu.Unlock()
-	//DPrintf("peer-%v send heart-beat to peer-%v in term currentTerm %v\n", rf.me, index, rf.currentTerm)
-	//if !additionalLogEntry { //heart beat only
-	//	reply := AppendEntriesReply{}
-	//	rf.sendAppendEntries(index, &req, &reply) // send AppendEntries RPC
-	//	DPrintf("peer-%v recv heart-beat from peer-%v in term [%v] req:%v, res:%v\n", rf.me, index, rf.currentTerm, req, reply)
-	//
-	//	rf.mu.Lock()
-	//	if rf.role != LEADER {
-	//		rf.mu.Unlock()
-	//		return
-	//	}
-	//	if reply.Term > rf.currentTerm {
-	//		rf.currentTerm = reply.Term
-	//		rf.TransformToFollower()
-	//	}
-	//	rf.mu.Unlock()
-	//	return
-	//}else {
-	for {
-		_, isLeader := rf.GetState()
-		if !isLeader {
-			break
-		}
-		rf.mu.Lock()
-		DPrintf("Suppose[Leader] peer-%v is  with LeaderLog[%v] in [term:%v] send to peer-%v, nextLogIndex[%v] matchIndex[%v]\n", rf.me, rf.log, rf.currentTerm, index, rf.nextIndex, rf.matchIndex)
-
-		req := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.GetEntryByLogIndex(rf.nextIndex[index] - 1).Index,
-			PrevLogTerm:  rf.GetEntryByLogIndex(rf.nextIndex[index] - 1).Term,
-			Entries:      rf.log[rf.nextIndex[index]:],
-			LeaderCommit: rf.commitIndex,
-		}
-
-		reply := AppendEntriesReply{}
-		rf.mu.Unlock()
-		rf.sendAppendEntries(index, &req, &reply) // send AppendEntries RPC
-		DPrintf("peer-%v recv reply from peer-%v in term [%v] req:%#v, res:%#v\n", rf.me, index, rf.currentTerm, req, reply)
-		rf.mu.Lock()
-		if rf.role != LEADER {
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Term > rf.currentTerm {
-			DPrintf("transfer to follower reply Term %v, currentTerm:%v", reply.Term, rf.currentTerm)
-			rf.currentTerm = reply.Term
-			rf.SaveRaftState(RaftState{
-				CurrentTerm: rf.currentTerm,
-				VotedFor:    rf.votedFor,
-				Log:         rf.log,
-			})
-			rf.TransformToFollower()
-			rf.mu.Unlock()
-			return
-		} else if rf.currentTerm != req.Term {
-			DPrintf("something odd happened currentTerm %v, replyTerm %v", rf.currentTerm, reply.Term)
-			rf.mu.Unlock()
-			return
-		} else if req.Term == reply.Term && req.Term == rf.currentTerm {
-			if reply.Success {
-				rf.nextIndex[index] = rf.GetLastLogEntry().Index + 1
-				rf.matchIndex[index] = req.PrevLogIndex + len(req.Entries)
-				DPrintf("==>reply success peer-%v nextIndex[%v] matchIndex[%v].\n", index, rf.nextIndex[index], rf.matchIndex[index])
-				updated := rf.UpdateCommitIndex()
-				if updated {
-					DPrintf("UpdateCommitIndex [leader] Leader %v, current status log [%v], commitIndex %v, matchIndex %v, nextIndex %v, lastApplied %v", rf.me, rf.log, rf.commitIndex, rf.matchIndex, rf.nextIndex, rf.lastApplied)
-				}
-			} else {
-				if rf.nextIndex[index] >= 1 { //why only contains == 1 here pass the test ?
-					rf.nextIndex[index]--
-				}
-			}
-		}
-		additionalLogEntry := rf.GetLastLogEntry().Index >= rf.nextIndex[index]
-		if !additionalLogEntry {
-			rf.mu.Unlock()
-			break
-		}
-		rf.mu.Unlock()
-		time.Sleep(time.Duration(5) * time.Millisecond)
 	}
 }
 
@@ -984,13 +1004,16 @@ func (rf *Raft) UpdateCommitIndex() bool {
 				count++
 			}
 		}
-
-	//	DPrintf("iter count:%v majority:%v nTerm:%v currentTerm:%v \n.", count, majority, rf.GetEntryByLogIndex(N).Term, rf.currentTerm)
+		DPrintf("[peer-%v %v] UpdateCommitIndex-Inspect [%v]", rf.me, rf.GetRoleName(),rf.matchIndex)
+		//	DPrintf("iter count:%v majority:%v nTerm:%v currentTerm:%v \n.", count, majority, rf.GetEntryByLogIndex(N).Term, rf.currentTerm)
 		if count >= majority && rf.GetEntryByLogIndex(N).Term == rf.currentTerm {
 			old := rf.commitIndex
-			rf.commitIndex = N
-			DPrintf("peer %v update commitIndex from [%v] to [%v]\n", rf.me, old, rf.commitIndex)
-			return true
+			if rf.commitIndex != N {
+				rf.commitIndex = N
+				DPrintf("[peer-%v %v] UpdateCommitIndex from [%v] to [%v]\n", rf.me, rf.GetRoleName(), old, rf.commitIndex)
+				return true
+			}
+			return false
 		} else {
 			N--
 		}
@@ -1006,6 +1029,8 @@ func (rf *Raft) ApplierLoop(applyCh chan ApplyMsg) {
 	go func() {
 		for !rf.killed() {
 			time.Sleep(time.Duration(10) * time.Millisecond)
+			atomic.AddInt32(&rf.lockCounter, 1)
+			DPrintf("[lock:ApplierLoop] peer-%v-lock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 			rf.mu.Lock()
 			if rf.commitIndex > rf.lastApplied {
 				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
@@ -1015,15 +1040,21 @@ func (rf *Raft) ApplierLoop(applyCh chan ApplyMsg) {
 						Command:      cmd.Command,
 						CommandIndex: cmd.Index,
 					}
-					applyCh <- msg
+
+					DPrintf("peer-%v role: %v ApplyCount %v\n", rf.me, rf.GetRoleName(), atomic.AddInt32(&rf.applyCount, 1))
+					if rf.role == LEADER {
+						applyCh <- msg
+					}
+
 					DPrintf("peer-%v role-%v ApplyMsg %v\n", rf.me, GetRoleName(rf.role), msg)
 					rf.lastApplied++
 				}
 			}
+			atomic.AddInt32(&rf.lockCounter, -1)
+			DPrintf("[unlock:ApplierLoop] peer-%v-unlock, counter %v]", rf.me, atomic.LoadInt32(&rf.lockCounter))
 			rf.mu.Unlock()
 		}
 	}()
-
 }
 
 func minmax(s []int) (int, int) {
@@ -1042,8 +1073,8 @@ func minmax(s []int) (int, int) {
 
 type RaftState struct {
 	CurrentTerm int
-	VotedFor string
-	Log	[]LogEntry
+	VotedFor    string
+	Log         []LogEntry
 }
 
 
